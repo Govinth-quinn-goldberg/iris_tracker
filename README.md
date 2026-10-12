@@ -1,0 +1,2 @@
+# gesture_assisted_solution_for_specially_abled_computer_access
+project made for MISsion'26 hackathon
