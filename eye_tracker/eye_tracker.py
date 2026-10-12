@@ -673,6 +673,23 @@ class CalibrationModel:
                 f"LOTO-CV={self.loto_target_errors[idx]:5.1f}px  (Target: {screen_targets_9[idx]})"
             )
 
+        # Rightmost calibration target & horizontal reach diagnostic
+        print("\n  [Calibration Diagnostic: Right-Edge Reach Comparison]")
+        cal_half_span = (0.92 - 0.50) * screen_w
+        safe_half_span = (screen_w / 2.0) - SAFE_MARGIN
+        h_scale = safe_half_span / cal_half_span if cal_half_span > 0 else 1.0
+        expected_right_safe = screen_w - SAFE_MARGIN
+        for p_idx in (2, 5, 8):  # Points 3, 6, 9 (rightmost column at fx = 0.92)
+            raw_px = float(summary["full_preds"][p_idx][0])
+            mapped_px = (screen_w / 2.0) + (raw_px - (screen_w / 2.0)) * h_scale
+            expected_cal_x = screen_targets_9[p_idx][0]
+            reach_status = "REACHES SAFE RIGHT" if mapped_px >= expected_right_safe - 1.0 else "SHORT OF SAFE RIGHT"
+            print(
+                f"    Point {p_idx + 1}: Expected Cal Dot X = {expected_cal_x}px | "
+                f"Fitted Raw X = {raw_px:5.1f}px | "
+                f"Mapped Cursor Target X = {mapped_px:5.1f}px (Safe Limit: {expected_right_safe}px, Reach: {mapped_px / expected_right_safe * 100:.1f}%) -> {reach_status}"
+            )
+
         return True, ""
 
     def predict(self, feature_vector_4d):
@@ -701,6 +718,16 @@ class CalibrationModel:
         sw, sh = self.screen_bounds
         if pred_x < -sw * 0.4 or pred_x > sw * 1.4 or pred_y < -sh * 0.4 or pred_y > sh * 1.4:
             return None
+
+        # Horizontal calibration range correction:
+        # Maps the horizontal calibration span [0.08*sw, 0.92*sw] to the safe screen span [SAFE_MARGIN, sw - SAFE_MARGIN]
+        # so that looking at the rightmost calibration target reaches the screen's rightmost safe coordinate.
+        mid_x = sw / 2.0
+        cal_half_span = (0.92 - 0.50) * sw
+        safe_half_span = mid_x - SAFE_MARGIN
+        if cal_half_span > 0:
+            h_scale = safe_half_span / cal_half_span
+            pred_x = mid_x + (pred_x - mid_x) * h_scale
 
         return pred_x, pred_y
 
@@ -1554,6 +1581,15 @@ def main():
             else:
                 hud_lines.append(f"Outlier Count: {gaze_filter.outlier_count} | Mode: {mode}")
 
+            if show_extended_diagnostics and calibration.is_valid:
+                expected_safe_right = screen_w - SAFE_MARGIN
+                cur_x = cursor.pos_x
+                reach_pct = min(cur_x / expected_safe_right * 100.0, 100.0) if expected_safe_right > 0 else 0.0
+                target_right_cal = int(0.92 * screen_w)
+                hud_lines.append(
+                    f"[EXT DIAG] Right Edge: TargetCal={target_right_cal}px | SafeLimit={expected_safe_right}px | CursorX={cur_x:.0f}px ({reach_pct:.1f}% reach)"
+                )
+
             if time.monotonic() < active_wink_expiry:
                 hud_lines.append(active_wink_label)
 
@@ -1580,6 +1616,13 @@ def main():
 
             elif key == ord("d"):
                 show_extended_diagnostics = not show_extended_diagnostics
+                print(f"  [DEBUG HUD] Extended Diagnostics: {'ENABLED' if show_extended_diagnostics else 'DISABLED'}")
+                if show_extended_diagnostics and calibration.is_valid and filt_pred_x is not None:
+                    safe_r = screen_w - SAFE_MARGIN
+                    print(
+                        f"  [DEBUG Right Edge] Cursor X={cursor.pos_x:.1f}px | Filt X={filt_pred_x:.1f}px | "
+                        f"Rightmost Cal Target X={int(0.92 * screen_w)}px | Right Safe Limit={safe_r}px"
+                    )
 
             elif key == ord("v"):
                 if not calibration.is_valid:
@@ -1682,8 +1725,21 @@ def main():
                                 f"Center-Hold Drift (3s): {net_drift:.1f}px | Mean Dynamic Cursor Lag: {mean_lag:.1f}px",
                                 f"Overall Mean Accuracy: {mean_tot:.1f}px  (Horiz Mean: {mean_h:.1f}px | Vert Mean: {mean_v:.1f}px)",
                                 f"Maximum Target Error: {max_tot:.1f}px",
-                                "-" * 75,
                             ]
+
+                            # Focused Right-Edge Reach Diagnostic
+                            right_samples = [s for s in verify_recorded_samples if "Right" in s["name"]]
+                            if right_samples:
+                                mean_r_pred_x = np.mean([s["filt_pred"][0] for s in right_samples])
+                                mean_r_cur_x = np.mean([s["cursor"][0] for s in right_samples])
+                                safe_r = screen_w - SAFE_MARGIN
+                                r_reach_pct = (mean_r_cur_x / safe_r * 100.0) if safe_r > 0 else 0.0
+                                target_r_x = int(0.92 * screen_w)
+                                verify_results_lines.append(
+                                    f"Right-Edge Diagnostic: Expected Cal Dot X={target_r_x}px | Pred X={mean_r_pred_x:.1f}px | Cursor X={mean_r_cur_x:.1f}px | Safe Limit={safe_r}px (Reach: {r_reach_pct:.1f}%)"
+                                )
+
+                            verify_results_lines.append("-" * 75)
 
                             for s in verify_recorded_samples:
                                 verify_results_lines.append(
