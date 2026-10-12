@@ -97,6 +97,18 @@ WINK_CONFIRM_FRAMES = 3
 CLICK_COOLDOWN_SEC = 1.0
 BASELINE_MIN_SAMPLES = 45
 
+# --- Deliberate Blink Command Configuration (Hands-Free Control) ---
+# Commands: 3 blinks -> Calibration ('C'), 4 blinks -> Cursor Test ('B'),
+#           5 blinks -> Full Control ('F'), 6 blinks -> Verification ('V')
+BLINK_CMD_EAR_CLOSE_THRESH = 0.165     # EAR below which both eyes are registered closed
+BLINK_CMD_EAR_OPEN_THRESH = 0.215      # EAR above which both eyes are registered reopened
+BLINK_CMD_MIN_CLOSED_SEC = 0.05        # Minimum closed duration to register a blink (debounce noise)
+BLINK_CMD_MAX_CLOSED_SEC = 0.80        # Maximum closed duration (longer is considered resting/sleeping)
+BLINK_CMD_MIN_OPEN_SEC = 0.05          # Minimum open duration between consecutive blinks
+BLINK_CMD_SETTLE_SEC = 0.85            # Recognition pause after last blink before executing command
+BLINK_CMD_INTER_MAX_SEC = 1.30         # Maximum interval between blinks in a sequence
+FULL_CONTROL_GAZE_CONFIRM_SEC = 3.0    # Timed gaze confirmation duration for hands-free Full Control
+
 # --- 9-Point Calibration Targets (Fractions of Screen Width & Height) ---
 CALIBRATION_TARGETS = [
     (0.08, 0.08),  # 1. Top-Left Corner
@@ -416,7 +428,7 @@ class GazeFeatureExtractor:
         left_ear = compute_eye_aspect_ratio(landmarks, LEFT_EYE_EAR_DEF)
         right_ear = compute_eye_aspect_ratio(landmarks, RIGHT_EYE_EAR_DEF)
 
-        if left_ear is None or right_ear is None:
+        if left_ear is None or right_ear is None or left_ear < 0.14 or right_ear < 0.14:
             return None
 
         # --- Left Eye in mirrored frame (user's physical left eye) ---
@@ -436,7 +448,9 @@ class GazeFeatureExtractor:
         u_l = (l_iris[0] - l_center_x) / l_width
         v_l_aperture = (l_iris[1] - l_eyelid_mid_y) / l_height
         v_l_canthi = (l_iris[1] - l_canthi_mid_y) / (l_width * 0.45)
-        v_l = (v_l_aperture + v_l_canthi) / 2.0
+        # Downward gaze: eyelid follows iris down (lid-lag), collapsing aperture distance.
+        # Bone-fixed canthi provide stable, uncompressed downward displacement.
+        v_l = v_l_canthi if v_l_canthi > 0 else (v_l_aperture + v_l_canthi) / 2.0
 
         # --- Right Eye in mirrored frame (user's physical right eye) ---
         r_outer = landmark_to_normalized_xy(landmarks[RIGHT_EYE_EAR_DEF["outer"]])  # 263
@@ -455,7 +469,9 @@ class GazeFeatureExtractor:
         u_r = (r_iris[0] - r_center_x) / r_width
         v_r_aperture = (r_iris[1] - r_eyelid_mid_y) / r_height
         v_r_canthi = (r_iris[1] - r_canthi_mid_y) / (r_width * 0.45)
-        v_r = (v_r_aperture + v_r_canthi) / 2.0
+        # Downward gaze: eyelid follows iris down (lid-lag), collapsing aperture distance.
+        # Bone-fixed canthi provide stable, uncompressed downward displacement.
+        v_r = v_r_canthi if v_r_canthi > 0 else (v_r_aperture + v_r_canthi) / 2.0
 
         # Plausibility sanity checks: iris must be near eye aperture
         if abs(u_l) > 1.8 or abs(v_l) > 2.0 or abs(u_r) > 1.8 or abs(v_r) > 2.0:
@@ -532,6 +548,10 @@ class CalibrationModel:
         self.loto_cv_v = None
         self.loto_target_errors = []
         self.screen_bounds = None
+        self.cal_up_span = None
+        self.cal_down_span = None
+        self.v_scale_up = 1.0
+        self.v_scale_down = 1.0
 
     def _fit_candidate(self, model_name, X, Y):
         n = len(X)
@@ -690,6 +710,46 @@ class CalibrationModel:
                 f"Mapped Cursor Target X = {mapped_px:5.1f}px (Safe Limit: {expected_right_safe}px, Reach: {mapped_px / expected_right_safe * 100:.1f}%) -> {reach_status}"
             )
 
+        # Vertical calibration targets & Top/Center/Bottom reach diagnostic
+        # Compute actual measured spans from calibration fit to ensure complete downward reach
+        top_row_y = float(np.mean([summary["full_preds"][i][1] for i in (0, 1, 2)]))
+        mid_row_y = float(np.mean([summary["full_preds"][i][1] for i in (3, 4, 5)]))
+        bot_row_y = float(np.mean([summary["full_preds"][i][1] for i in (6, 7, 8)]))
+        self.cal_up_span = max(float(mid_row_y - top_row_y), 50.0)
+        self.cal_down_span = max(float(bot_row_y - mid_row_y), 50.0)
+
+        mid_y = screen_h / 2.0
+        safe_top_span = mid_y - SAFE_MARGIN
+        safe_bottom_span = (screen_h - SAFE_MARGIN) - mid_y
+        self.v_scale_up = float(np.clip(safe_top_span / self.cal_up_span, 0.90, 1.45))
+        self.v_scale_down = float(np.clip(safe_bottom_span / self.cal_down_span, 0.90, 1.45))
+
+        print("\n  [Calibration Diagnostic: Vertical (Top/Center/Bottom) Reach Comparison]")
+        print(f"    Measured Spans: Up={self.cal_up_span:.1f}px (Scale: {self.v_scale_up:.3f}) | Down={self.cal_down_span:.1f}px (Scale: {self.v_scale_down:.3f})")
+        expected_top_safe = SAFE_MARGIN
+        expected_bottom_safe = screen_h - SAFE_MARGIN
+        vert_check_indices = [
+            (1, "Top-Center (Point 2)"),
+            (4, "Center (Point 5)"),
+            (7, "Bottom-Center (Point 8)")
+        ]
+        for p_idx, p_name in vert_check_indices:
+            raw_py = float(summary["full_preds"][p_idx][1])
+            v_scale = self.v_scale_down if raw_py >= mid_y else self.v_scale_up
+            mapped_py = mid_y + (raw_py - mid_y) * v_scale
+            expected_cal_y = screen_targets_9[p_idx][1]
+            raw_v_feat = train_X[p_idx, 1]
+            if p_idx == 7:
+                reach_status = "REACHES SAFE BOTTOM" if mapped_py >= expected_bottom_safe - 1.0 else "SHORT OF SAFE BOTTOM"
+            elif p_idx == 1:
+                reach_status = "REACHES SAFE TOP" if mapped_py <= expected_top_safe + 1.0 else "SHORT OF SAFE TOP"
+            else:
+                reach_status = "CENTER ALIGNED"
+            print(
+                f"    {p_name}: Target Y = {expected_cal_y}px | Vert Feature v = {raw_v_feat:+.3f} | "
+                f"Fitted Raw Y = {raw_py:5.1f}px | Mapped Cursor Target Y = {mapped_py:5.1f}px -> {reach_status}"
+            )
+
         return True, ""
 
     def predict(self, feature_vector_4d):
@@ -728,6 +788,15 @@ class CalibrationModel:
         if cal_half_span > 0:
             h_scale = safe_half_span / cal_half_span
             pred_x = mid_x + (pred_x - mid_x) * h_scale
+
+        # Vertical calibration range correction:
+        # Maps calibrated downward and upward spans to safe screen bounds [SAFE_MARGIN, sh - SAFE_MARGIN]
+        # using actual measured calibration ranges to ensure reliable reach to screen top and bottom edges.
+        mid_y = sh / 2.0
+        if pred_y >= mid_y:
+            pred_y = mid_y + (pred_y - mid_y) * self.v_scale_down
+        else:
+            pred_y = mid_y + (pred_y - mid_y) * self.v_scale_up
 
         return pred_x, pred_y
 
@@ -827,6 +896,160 @@ class WinkDetector:
 
         return None
 
+    def reset_gesture_state(self):
+        """Zero out ongoing wink accumulation without losing baseline calibration."""
+        self._left_wink_counter = 0
+        self._right_wink_counter = 0
+        self._gesture_latched = False
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║                   DELIBERATE MULTI-BLINK COMMAND DETECTOR                ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+class BlinkCommandDetector:
+    """
+    Detects deliberate multi-blink sequences for hands-free mode commands:
+      - 3 blinks -> Calibration ('C')
+      - 4 blinks -> Cursor Test ('B')
+      - 5 blinks -> Full Control ('F')
+      - 6 blinks -> Verification ('V')
+
+    State Machine & Debounce:
+      - Complete blink requires:
+        1. Both eyes closed (EAR < close_thresh) for min_closed_sec (>= 50ms) to max_closed_sec.
+        2. Both eyes reopened (EAR > open_thresh) for min_open_sec (>= 50ms).
+      - Increments blink_count and resets recognition pause (settle_sec = 0.85s).
+      - After settle_sec with no further blinks:
+        * 1 or 2 blinks: ordinary blinking -> silently reset without action.
+        * 3, 4, 5, 6 blinks: execute corresponding command exactly once.
+      - Wink clicks are suspended whenever is_collecting_command is True.
+    """
+
+    def __init__(
+        self,
+        close_thresh=BLINK_CMD_EAR_CLOSE_THRESH,
+        open_thresh=BLINK_CMD_EAR_OPEN_THRESH,
+        min_closed_sec=BLINK_CMD_MIN_CLOSED_SEC,
+        max_closed_sec=BLINK_CMD_MAX_CLOSED_SEC,
+        min_open_sec=BLINK_CMD_MIN_OPEN_SEC,
+        settle_sec=BLINK_CMD_SETTLE_SEC,
+        inter_max_sec=BLINK_CMD_INTER_MAX_SEC,
+    ):
+        self.default_close_thresh = float(close_thresh)
+        self.default_open_thresh = float(open_thresh)
+        self.close_thresh = float(close_thresh)
+        self.open_thresh = float(open_thresh)
+        self.min_closed_sec = float(min_closed_sec)
+        self.max_closed_sec = float(max_closed_sec)
+        self.min_open_sec = float(min_open_sec)
+        self.settle_sec = float(settle_sec)
+        self.inter_max_sec = float(inter_max_sec)
+
+        self.state = "OPEN"
+        self.state_enter_t = 0.0
+        self.last_blink_reopen_t = 0.0
+        self.blink_count = 0
+        self.sequence_active = False
+        self.lockout_until = 0.0
+        self.last_fired_command = None
+        self.last_fired_t = 0.0
+
+    def update_baseline(self, baseline_left, baseline_right):
+        if baseline_left is not None and baseline_right is not None:
+            base_avg = (baseline_left + baseline_right) / 2.0
+            self.close_thresh = float(np.clip(base_avg * 0.62, 0.13, 0.20))
+            self.open_thresh = float(np.clip(base_avg * 0.80, 0.18, 0.28))
+
+    def reset(self):
+        self.state = "OPEN"
+        self.state_enter_t = 0.0
+        self.last_blink_reopen_t = 0.0
+        self.blink_count = 0
+        self.sequence_active = False
+
+    @property
+    def is_collecting_command(self):
+        return self.sequence_active or (self.state == "CLOSED")
+
+    def get_status_info(self, now=None):
+        if now is None:
+            now = time.monotonic()
+        if not self.sequence_active:
+            if self.last_fired_command and (now - self.last_fired_t < 2.5):
+                return f"CMD: {self.last_fired_command.upper()}", 0.0, 0
+            return None, 0.0, 0
+        rem = max(0.0, self.settle_sec - (now - self.last_blink_reopen_t))
+        return f"Blinks: {self.blink_count}", rem, self.blink_count
+
+    def update(self, left_ear, right_ear, now=None):
+        if now is None:
+            now = time.monotonic()
+
+        if now < self.lockout_until:
+            return None
+
+        if left_ear is None or right_ear is None:
+            return None
+
+        both_closed = (left_ear < self.close_thresh) and (right_ear < self.close_thresh)
+        both_open = (left_ear > self.open_thresh) and (right_ear > self.open_thresh)
+
+        # Check sequence timeout / settle window
+        if self.sequence_active and self.state == "OPEN":
+            elapsed_since_reopen = now - self.last_blink_reopen_t
+
+            if elapsed_since_reopen >= self.settle_sec:
+                fired_cmd = None
+                if self.blink_count == 3:
+                    fired_cmd = "calibration"
+                elif self.blink_count == 4:
+                    fired_cmd = "cursor_test"
+                elif self.blink_count == 5:
+                    fired_cmd = "full_control"
+                elif self.blink_count == 6:
+                    fired_cmd = "verify"
+
+                self.blink_count = 0
+                self.sequence_active = False
+
+                if fired_cmd is not None:
+                    self.lockout_until = now + 1.2
+                    self.last_fired_command = fired_cmd
+                    self.last_fired_t = now
+                    return fired_cmd
+                return None
+
+            if elapsed_since_reopen > self.inter_max_sec:
+                self.blink_count = 0
+                self.sequence_active = False
+                return None
+
+        # State transition handling
+        if self.state == "OPEN":
+            if both_closed:
+                if (now - self.last_blink_reopen_t) >= self.min_open_sec:
+                    self.state = "CLOSED"
+                    self.state_enter_t = now
+
+        elif self.state == "CLOSED":
+            closed_dur = now - self.state_enter_t
+            if closed_dur > self.max_closed_sec:
+                self.blink_count = 0
+                self.sequence_active = False
+                if both_open:
+                    self.state = "OPEN"
+                    self.state_enter_t = now
+            elif both_open:
+                if closed_dur >= self.min_closed_sec:
+                    self.blink_count += 1
+                    self.sequence_active = True
+                    self.last_blink_reopen_t = now
+                self.state = "OPEN"
+                self.state_enter_t = now
+
+        return None
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║                   RATE-LIMITED CURSOR CONTROLLER                         ║
@@ -893,20 +1116,66 @@ class CursorController:
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 MODE_COLORS = {
-    "preview":      (255, 200, 0),    # Cyan/Aqua
-    "cursor_test":  (0, 180, 255),    # Amber/Orange
-    "full_control": (0, 0, 255),      # Bright Red
-    "calibration":  (0, 255, 0),      # Bright Green
-    "verify_mode":  (255, 120, 255),  # Magenta
+    "preview":              (255, 200, 0),    # Cyan/Aqua
+    "cursor_test":          (0, 180, 255),    # Amber/Orange
+    "full_control":         (0, 0, 255),      # Bright Red
+    "calibration":          (0, 255, 0),      # Bright Green
+    "verify_mode":          (255, 120, 255),  # Magenta
+    "confirm_full_control": (0, 140, 255),    # Vibrant Safety Orange
 }
 
 MODE_LABELS = {
-    "preview":      "MODE A: PREVIEW ONLY (Safe - Mouse Disabled)",
-    "cursor_test":  "MODE B: CURSOR TEST (Clicks Disabled)",
-    "full_control": "MODE C: FULL CONTROL ACTIVE (Cursor + Clicks)",
-    "calibration":  "9-POINT CALIBRATION IN PROGRESS",
-    "verify_mode":  "9-POINT CALIBRATION VERIFICATION & CENTER HOLD",
+    "preview":              "MODE A: PREVIEW ONLY (Safe - Mouse Disabled)",
+    "cursor_test":          "MODE B: CURSOR TEST (Clicks Disabled)",
+    "full_control":         "MODE C: FULL CONTROL ACTIVE (Cursor + Clicks)",
+    "calibration":          "9-POINT CALIBRATION IN PROGRESS",
+    "verify_mode":          "9-POINT CALIBRATION VERIFICATION & CENTER HOLD",
+    "confirm_full_control": "SAFETY CONFIRMATION: FULL CONTROL PENDING",
 }
+
+
+def draw_full_control_confirmation_card(frame, rem_sec, pct):
+    fh, fw = frame.shape[:2]
+    card_w = 480
+    card_h = 115
+    x1 = max(0, (fw - card_w) // 2)
+    y1 = max(0, (fh - card_h) // 2 - 25)
+    x2 = min(fw, x1 + card_w)
+    y2 = min(fh, y1 + card_h)
+
+    # Semi-transparent dark background card with safety orange border
+    sub_img = frame[y1:y2, x1:x2]
+    dark_rect = np.full_like(sub_img, (20, 20, 80))
+    cv2.addWeighted(dark_rect, 0.85, sub_img, 0.15, 0, sub_img)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 140, 255), 2)
+
+    # Title Banner
+    cv2.putText(
+        frame, "SAFETY CONFIRMATION: FULL CONTROL",
+        (x1 + 16, y1 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 220, 255), 2
+    )
+
+    # Status / Countdown text
+    cv2.putText(
+        frame, f"Hold gaze on screen to confirm ({rem_sec:.1f}s remaining)...",
+        (x1 + 16, y1 + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 1
+    )
+
+    # Progress bar
+    bar_x = x1 + 16
+    bar_y = y1 + 62
+    bar_w = card_w - 32
+    bar_h = 14
+    fill_w = int(bar_w * pct)
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (40, 40, 40), -1)
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), (0, 200, 0), -1)
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (180, 180, 180), 1)
+
+    # Instructions footer
+    cv2.putText(
+        frame, "Keyboard: 'F' confirms | Look away, close eyes or ESC to cancel",
+        (x1 + 12, y1 + 98), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1
+    )
 
 
 def draw_face_and_iris_landmarks(frame, landmarks, width, height):
@@ -1195,7 +1464,10 @@ def main():
         dead_zone_px=DEAD_ZONE_PX, screen_w=screen_w, screen_h=screen_h
     )
     wink_detector = WinkDetector()
+    blink_cmd_detector = BlinkCommandDetector()
     cursor = CursorController(screen_w, screen_h, speed_scale=CURSOR_SPEED_SCALE)
+
+    confirm_fc_start_t = 0.0
 
     # Calibration Runtime Variables
     cal_targets_px = [
@@ -1225,6 +1497,8 @@ def main():
     last_processed_frame_id = -1
     prev_timestamp_ms = 0
     consecutive_no_face_frames = 0
+    face_is_lost = False
+    gaze_is_stale = False
     last_valid_gaze_time = 0.0
     active_wink_label = ""
     active_wink_expiry = 0.0
@@ -1256,15 +1530,78 @@ def main():
     print("\n" + "=" * 70)
     print("                 SYSTEM ACTIVE - PREVIEW ONLY (SAFE)               ")
     print("=" * 70)
-    print("  Controls:")
-    print("    C       --> Run 9-Point Calibration (Fits Decoupled / Affine Models)")
-    print("    V       --> Run 9-Point Verification Test (Reports Horiz & Vert Errors)")
-    print("    B       --> Cursor Test Mode (moves cursor, clicks disabled)")
-    print("    F       --> Full Control Mode (confirm with F)")
-    print("    P       --> Return to Mode A: Preview Only (Safe)")
-    print("    D       --> Toggle Extended Debug HUD")
-    print("    ESC / Q --> Exit")
+    print("  Hands-Free Deliberate Blink Commands:")
+    print("    3 Blinks (or 'C') --> 9-Point Calibration")
+    print("    4 Blinks (or 'B') --> Mode B: Cursor Test (safe mouse movement)")
+    print("    5 Blinks (or 'F') --> Mode C: Full Control (Timed Gaze Confirmation)")
+    print("    6 Blinks (or 'V') --> 9-Point Accuracy Verification Test")
+    print("  Keyboard Shortcuts (Fallback):")
+    print("    P                 --> Return to Mode A: Preview Only (Safe)")
+    print("    D                 --> Toggle Extended Debug HUD")
+    print("    ESC / Q           --> Exit Safely")
     print("=" * 70 + "\n")
+
+    face_detected = False
+    iris_detected = False
+
+    def start_calibration():
+        nonlocal mode, cal_index, cal_collecting, cal_status_message, calibration
+        if not face_detected or not iris_detected:
+            print("  [NOTICE] Face or iris not detected. Position face before calibrating.")
+            return False
+        print("  [CALIBRATION] Starting 9-point calibration...")
+        mode = "calibration"
+        cal_index = 0
+        cal_gaze_samples_median.clear()
+        cal_screen_targets.clear()
+        cal_collecting = False
+        cal_buffer.clear()
+        cal_status_message = "Look directly at the target dot and press SPACE"
+        wink_detector.reset()
+        blink_cmd_detector.reset()
+        feature_extractor.reset()
+        calibration = CalibrationModel()
+        return True
+
+    def start_cursor_test():
+        nonlocal mode
+        if not calibration.is_valid:
+            print("  [NOTICE] Calibration required first. Blink 3 times or press 'C' to calibrate.")
+            return False
+        mode = "cursor_test"
+        print("  [MODE] Mode B: CURSOR TEST ACTIVE (Clicks Disabled).")
+        return True
+
+    def start_full_control():
+        nonlocal mode, confirm_fc_start_t
+        if not calibration.is_valid:
+            print("  [NOTICE] Calibration required first. Blink 3 times or press 'C' to calibrate.")
+            return False
+        elif not wink_detector.baseline_ready:
+            print("  [NOTICE] Complete calibration first to set baseline.")
+            return False
+        mode = "confirm_full_control"
+        confirm_fc_start_t = time.monotonic()
+        print("\n  [SAFETY] FULL CONTROL PENDING: Hold gaze on screen (3.0s) or press 'F' to confirm.")
+        return True
+
+    def start_verification():
+        nonlocal mode, verify_stage, verify_center_start_t, verify_index, verify_results_lines
+        if not calibration.is_valid:
+            print("  [NOTICE] Calibrate first (blink 3 times or press C) before running Verification Mode.")
+            return False
+        print("  [VERIFY] Starting Calibration Verification & Center-Hold Test...")
+        mode = "verify_mode"
+        verify_stage = "center_hold"
+        verify_center_start_t = time.monotonic()
+        verify_center_raw_pts.clear()
+        verify_center_pure_1euro_pts.clear()
+        verify_center_filt_pts.clear()
+        verify_center_cursor_pts.clear()
+        verify_index = 0
+        verify_recorded_samples.clear()
+        verify_results_lines = None
+        return True
 
     try:
         while True:
@@ -1325,21 +1662,44 @@ def main():
                 num_landmarks = len(landmarks)
                 face_detected = True
                 iris_detected = num_landmarks >= 478
+                consecutive_no_face_frames = 0
+
+                # Always compute eye aspect ratios on detected face frames for blink commands
+                left_ear = compute_eye_aspect_ratio(landmarks, LEFT_EYE_EAR_DEF)
+                right_ear = compute_eye_aspect_ratio(landmarks, RIGHT_EYE_EAR_DEF)
 
                 if iris_detected:
                     extracted = feature_extractor.extract(landmarks)
                     if extracted is not None:
-                        feat_dict, left_ear, right_ear = extracted
+                        feat_dict, _, _ = extracted
                         last_valid_gaze_time = time.monotonic()
-                        consecutive_no_face_frames = 0
             else:
                 consecutive_no_face_frames += 1
 
+            face_is_lost = consecutive_no_face_frames > FACE_LOST_FREEZE_FRAMES
             t_feat_ms = (time.perf_counter() - t_feat_start) * 1000.0
+
+            # Hands-Free Deliberate Blink Commands Dispatcher
+            blink_cmd = None
+            if left_ear is not None and right_ear is not None and not face_is_lost:
+                if wink_detector.baseline_ready:
+                    blink_cmd_detector.update_baseline(wink_detector.baseline_left, wink_detector.baseline_right)
+
+                # Only collect blink commands when not actively collecting a calibration target
+                if mode != "calibration" or not cal_collecting:
+                    blink_cmd = blink_cmd_detector.update(left_ear, right_ear)
+
+            if blink_cmd == "calibration":
+                start_calibration()
+            elif blink_cmd == "cursor_test":
+                start_cursor_test()
+            elif blink_cmd == "full_control":
+                start_full_control()
+            elif blink_cmd == "verify":
+                start_verification()
 
             # ── 4. Predict Gaze & Adaptive Filter ───────────────────
             gaze_is_stale = (time.monotonic() - last_valid_gaze_time) > STALE_GAZE_TIMEOUT_SEC
-            face_is_lost = consecutive_no_face_frames > FACE_LOST_FREEZE_FRAMES
             is_outlier_frame = False
             outlier_reason_str = ""
 
@@ -1486,6 +1846,29 @@ def main():
                         cal_screen_targets.clear()
                         cal_status_message = f"Calibration failed ({msg}). Press SPACE to retry."
 
+            # --- SUB-MODE: Hands-Free Full Control Confirmation ---
+            elif mode == "confirm_full_control":
+                if calib_win_open:
+                    cv2.destroyWindow(CALIB_WINDOW)
+                    calib_win_open = False
+                if verify_win_open:
+                    cv2.destroyWindow(VERIFY_WINDOW)
+                    verify_win_open = False
+
+                elapsed_confirm = time.monotonic() - confirm_fc_start_t
+                rem_confirm = max(0.0, FULL_CONTROL_GAZE_CONFIRM_SEC - elapsed_confirm)
+                pct_confirm = min(elapsed_confirm / FULL_CONTROL_GAZE_CONFIRM_SEC, 1.0)
+
+                # Safe confirmation: requires continuous face presence and open eyes
+                if face_is_lost or (left_ear is not None and right_ear is not None and left_ear < 0.14 and right_ear < 0.14):
+                    mode = "preview"
+                    print("  [SAFETY] Eyes closed or face lost: Full Control cancelled.")
+                elif elapsed_confirm >= FULL_CONTROL_GAZE_CONFIRM_SEC:
+                    mode = "full_control"
+                    print("  [MODE] Hands-free confirmation completed: Mode C: FULL CONTROL ACTIVE.")
+                    active_wink_label = "MODE C: FULL CONTROL ACTIVE"
+                    active_wink_expiry = time.monotonic() + 2.0
+
             # --- NORMAL TRACKING (Preview / Cursor Test / Full Control) ---
             else:
                 if calib_win_open:
@@ -1502,7 +1885,10 @@ def main():
 
                 detected_gesture = None
                 if left_ear is not None and right_ear is not None and not face_is_lost:
-                    detected_gesture = wink_detector.update(left_ear, right_ear)
+                    if not blink_cmd_detector.is_collecting_command:
+                        detected_gesture = wink_detector.update(left_ear, right_ear)
+                    else:
+                        wink_detector.reset_gesture_state()
 
                 if detected_gesture is not None:
                     now_t = time.monotonic()
@@ -1575,11 +1961,36 @@ def main():
                 hud_lines.append(
                     f"Raw: ({raw_pred_x:.0f}, {raw_pred_y:.0f}) | Filt: ({filt_pred_x:.0f}, {filt_pred_y:.0f}) | Cursor: ({cursor.pos_x:.0f}, {cursor.pos_y:.0f}) | Lag: {cur_lag:.0f}px"
                 )
+                target_y_cal_str = ""
+                if mode == "calibration" and cal_index < len(cal_targets_px):
+                    target_y_cal_str = f"TargetY={cal_targets_px[cal_index][1]}px | "
+                hud_lines.append(
+                    f"Vert Tracking: {target_y_cal_str}RawY={raw_pred_y:.0f}px | FiltY={filt_pred_y:.0f}px | CursorY={cursor.pos_y:.0f}px | SafeBottom={screen_h - SAFE_MARGIN}px"
+                )
                 hud_lines.append(
                     f"JitterDelta: {diff_tot:.0f}px (dX:{diff_x:.0f}, dY:{diff_y:.0f}) | Outliers: {gaze_filter.outlier_count} | Mode: {mode}"
                 )
             else:
                 hud_lines.append(f"Outlier Count: {gaze_filter.outlier_count} | Mode: {mode}")
+
+            blink_cmd_status, blink_cmd_rem, blink_cmd_count = blink_cmd_detector.get_status_info()
+            if blink_cmd_count > 0:
+                cmd_hint = ""
+                if blink_cmd_count == 1 or blink_cmd_count == 2:
+                    cmd_hint = " (Need 3=Cal, 4=Test, 5=Full, 6=Verify)"
+                elif blink_cmd_count == 3:
+                    cmd_hint = " -> CALIBRATION (C)"
+                elif blink_cmd_count == 4:
+                    cmd_hint = " -> CURSOR TEST (B)"
+                elif blink_cmd_count == 5:
+                    cmd_hint = " -> FULL CONTROL (F)"
+                elif blink_cmd_count == 6:
+                    cmd_hint = " -> VERIFY (V)"
+                hud_lines.append(
+                    f"[BLINK CMD] Sequence: {blink_cmd_count} Blinks{cmd_hint} | Settle: {blink_cmd_rem:.2f}s"
+                )
+            elif blink_cmd_status:
+                hud_lines.append(f"[BLINK CMD] {blink_cmd_status}")
 
             if show_extended_diagnostics and calibration.is_valid:
                 expected_safe_right = screen_w - SAFE_MARGIN
@@ -1589,11 +2000,28 @@ def main():
                 hud_lines.append(
                     f"[EXT DIAG] Right Edge: TargetCal={target_right_cal}px | SafeLimit={expected_safe_right}px | CursorX={cur_x:.0f}px ({reach_pct:.1f}% reach)"
                 )
+                expected_safe_bottom = screen_h - SAFE_MARGIN
+                cur_y = cursor.pos_y
+                reach_bottom_pct = min(cur_y / expected_safe_bottom * 100.0, 100.0) if expected_safe_bottom > 0 else 0.0
+                target_bottom_cal = int(0.92 * screen_h)
+                hud_lines.append(
+                    f"[EXT DIAG] Bottom Edge: TargetCal={target_bottom_cal}px | SafeLimit={expected_safe_bottom}px | CursorY={cur_y:.0f}px ({reach_bottom_pct:.1f}% reach)"
+                )
+                if calibration.cal_down_span is not None:
+                    hud_lines.append(
+                        f"[EXT DIAG] V-Scale: Down={calibration.v_scale_down:.3f} (Span={calibration.cal_down_span:.0f}px) | Up={calibration.v_scale_up:.3f} (Span={calibration.cal_up_span:.0f}px)"
+                    )
 
             if time.monotonic() < active_wink_expiry:
                 hud_lines.append(active_wink_label)
 
-            hud_lines.append("Shortcuts: C=Calib  V=Verify(9pts)  B=CursorTest  F=Full  P=Preview  Q=Quit")
+            hud_lines.append("Shortcuts: C/3bl=Calib  B/4bl=Test  F/5bl=Full  V/6bl=Verify  P=Preview  Q=Quit")
+
+            if mode == "confirm_full_control":
+                elapsed_confirm = time.monotonic() - confirm_fc_start_t
+                rem_confirm = max(0.0, FULL_CONTROL_GAZE_CONFIRM_SEC - elapsed_confirm)
+                pct_confirm = min(elapsed_confirm / FULL_CONTROL_GAZE_CONFIRM_SEC, 1.0)
+                draw_full_control_confirmation_card(frame, rem_confirm, pct_confirm)
 
             draw_hud(frame, hud_lines, mode)
             t_draw_ms = (time.perf_counter() - t_draw_start) * 1000.0
@@ -1619,26 +2047,18 @@ def main():
                 print(f"  [DEBUG HUD] Extended Diagnostics: {'ENABLED' if show_extended_diagnostics else 'DISABLED'}")
                 if show_extended_diagnostics and calibration.is_valid and filt_pred_x is not None:
                     safe_r = screen_w - SAFE_MARGIN
+                    safe_b = screen_h - SAFE_MARGIN
                     print(
                         f"  [DEBUG Right Edge] Cursor X={cursor.pos_x:.1f}px | Filt X={filt_pred_x:.1f}px | "
                         f"Rightmost Cal Target X={int(0.92 * screen_w)}px | Right Safe Limit={safe_r}px"
                     )
+                    print(
+                        f"  [DEBUG Bottom Edge] Cursor Y={cursor.pos_y:.1f}px | Filt Y={filt_pred_y:.1f}px | "
+                        f"Bottom Cal Target Y={int(0.92 * screen_h)}px | Bottom Safe Limit={safe_b}px"
+                    )
 
             elif key == ord("v"):
-                if not calibration.is_valid:
-                    print("  [NOTICE] Calibrate first (press C) before running the Verification Mode.")
-                else:
-                    print("  [VERIFY] Starting Calibration Verification & Center-Hold Test...")
-                    mode = "verify_mode"
-                    verify_stage = "center_hold"
-                    verify_center_start_t = time.monotonic()
-                    verify_center_raw_pts.clear()
-                    verify_center_pure_1euro_pts.clear()
-                    verify_center_filt_pts.clear()
-                    verify_center_cursor_pts.clear()
-                    verify_index = 0
-                    verify_recorded_samples.clear()
-                    verify_results_lines = None
+                start_verification()
 
             elif key == 32 and mode == "verify_mode":
                 if verify_stage == "grid_verification":
@@ -1739,6 +2159,25 @@ def main():
                                     f"Right-Edge Diagnostic: Expected Cal Dot X={target_r_x}px | Pred X={mean_r_pred_x:.1f}px | Cursor X={mean_r_cur_x:.1f}px | Safe Limit={safe_r}px (Reach: {r_reach_pct:.1f}%)"
                                 )
 
+                            # Focused Vertical Reach & Accuracy Diagnostic (Top-Center, Center, Bottom-Center)
+                            vert_key_targets = ["Top-Center Edge", "Center", "Bottom-Center Edge"]
+                            vert_samples = [s for s in verify_recorded_samples if s["name"] in vert_key_targets]
+                            if vert_samples:
+                                verify_results_lines.append("Vertical Tracking Diagnostics (Top-Center / Center / Bottom-Center):")
+                                for vs in vert_samples:
+                                    t_y = vs["target"][1]
+                                    raw_p_y = vs["raw_pred"][1]
+                                    filt_p_y = vs["filt_pred"][1]
+                                    cur_p_y = vs["cursor"][1]
+                                    v_feat = vs["gaze_feature"][1]
+                                    v_err = vs["err_y"]
+                                    cur_lag_y = abs(filt_p_y - cur_p_y)
+                                    verify_results_lines.append(
+                                        f"  {vs['name']:18s} -> Target Y={t_y}px | Feature v={v_feat:+.3f} | "
+                                        f"RawPred Y={raw_p_y}px | FiltPred Y={filt_p_y}px | Cursor Y={cur_p_y}px | "
+                                        f"VertErr={v_err:.1f}px | CursorLagY={cur_lag_y:.1f}px"
+                                    )
+
                             verify_results_lines.append("-" * 75)
 
                             for s in verify_recorded_samples:
@@ -1762,63 +2201,27 @@ def main():
                     print("  [Verify] Verification test dismissed. Returned to Preview Only mode.")
 
             elif key == ord("c"):
-                if not face_detected or not iris_detected:
-                    print("  [NOTICE] Face or iris not detected. Position face before calibrating.")
-                else:
-                    print("  [CALIBRATION] Starting 9-point calibration...")
-                    mode = "calibration"
-                    cal_index = 0
-                    cal_gaze_samples_median.clear()
-                    cal_screen_targets.clear()
-                    cal_collecting = False
-                    cal_buffer.clear()
-                    cal_status_message = "Look directly at the target dot and press SPACE"
-                    wink_detector.reset()
-                    feature_extractor.reset()
-                    calibration = CalibrationModel()
+                start_calibration()
 
             elif key == ord("p"):
                 mode = "preview"
                 print("  [MODE] Returned to Mode A: Preview Only (Safe).")
 
             elif key == ord("b"):
-                if not calibration.is_valid:
-                    print("  [NOTICE] Calibration required first. Press 'C' to calibrate.")
-                else:
-                    mode = "cursor_test"
-                    print("  [MODE] Mode B: CURSOR TEST ACTIVE (Clicks Disabled).")
+                start_cursor_test()
 
             elif key == ord("f"):
-                if not calibration.is_valid:
-                    print("  [NOTICE] Calibration required first. Press 'C' to calibrate.")
-                elif not wink_detector.baseline_ready:
-                    print("  [NOTICE] Complete calibration first to set baseline.")
+                if mode == "confirm_full_control":
+                    mode = "full_control"
+                    print("  [MODE] Keyboard confirmed: Mode C: FULL CONTROL ACTIVE.")
+                    active_wink_label = "MODE C: FULL CONTROL ACTIVE"
+                    active_wink_expiry = time.monotonic() + 2.0
                 else:
-                    print("\n  [SAFETY] Press 'F' again to confirm FULL CONTROL, or any other key to cancel.")
-                    confirm_img = frame.copy()
-                    cv2.rectangle(
-                        confirm_img,
-                        (frame_w // 2 - 220, frame_h // 2 - 40),
-                        (frame_w // 2 + 220, frame_h // 2 + 40),
-                        (0, 0, 180), -1
-                    )
-                    cv2.putText(
-                        confirm_img, "Press 'F' again to confirm FULL CONTROL",
-                        (frame_w // 2 - 200, frame_h // 2 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2
-                    )
-                    cv2.putText(
-                        confirm_img, "Any other key to cancel",
-                        (frame_w // 2 - 100, frame_h // 2 + 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1
-                    )
-                    cv2.imshow(CAMERA_WINDOW, confirm_img)
-                    ck = cv2.waitKey(0) & 0xFF
-                    if ck == ord("f"):
-                        mode = "full_control"
-                        print("  [MODE] Mode C: FULL CONTROL ACTIVE.")
-                    else:
-                        print("  [SAFETY] Full Control cancelled.")
+                    start_full_control()
+
+            elif mode == "confirm_full_control" and key not in (255, -1):
+                mode = "preview"
+                print("  [SAFETY] Full Control confirmation cancelled by key press.")
 
             elif key == 32 and mode == "calibration":
                 if cal_index < len(cal_targets_px) and not cal_collecting:
