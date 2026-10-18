@@ -76,7 +76,7 @@ BETA = 0.005
 D_CUTOFF = 1.0
 
 # Resting dead zone in screen pixels (locks cursor during fixation with zero drift).
-DEAD_ZONE_PX = 10.0
+DEAD_ZONE_PX = 4.0
 
 # Head pose low-pass smoothing factor (heavy smoothing decouples head jitter).
 HEAD_SMOOTH_ALPHA = 0.06
@@ -361,27 +361,44 @@ class AdaptiveGazeFilter:
         self.dy_prev = dy_hat
 
         # 4. Continuous Speed-Modulated Dead Zone:
-        # - Saccades (speed >= 150 px/s): effective dead zone smoothly collapses to 0 px,
-        #   allowing the anchor to follow true gaze with ZERO lagging deficit or creep.
+        # - Saccades (speed >= 150 px/s): effective dead zone smoothly collapses to 0 px.
         # - Resting Fixation (speed ~ 0 px/s): effective dead zone expands to DEAD_ZONE_PX,
         #   locking the cursor with 0.000 px drift and zero micro-tremor.
         # - Slow Smooth Pursuit / Drift: continuous boundary pull smoothly slides the anchor
-        #   without any discrete snapping steps.
+        #   without any discrete snapping steps (< 1.5px per frame).
+        # - Direction Reversal: when gaze velocity reverses relative to the anchor vector,
+        #   the anchor is realigned to prevent the 2x dead-zone hysteresis trap.
         speed = np.hypot(dx_hat, dy_hat)
-        saccade_speed = 150.0
-        effective_dz = self.dead_zone_px * max(0.0, 1.0 - speed / saccade_speed)
+        slow_thresh = 50.0
+        saccade_speed = 180.0
+        if speed <= slow_thresh:
+            effective_dz = self.dead_zone_px
+        else:
+            effective_dz = self.dead_zone_px * max(0.0, 1.0 - (speed - slow_thresh) / (saccade_speed - slow_thresh))
+
         anchor_dist = np.hypot(fx - self.anchor_x, fy - self.anchor_y)
 
         if anchor_dist <= effective_dz or (effective_dz <= 1e-6 and anchor_dist < 1e-6):
             out_x = self.anchor_x
             out_y = self.anchor_y
         else:
-            excess = anchor_dist - effective_dz
-            ratio = excess / anchor_dist
-            self.anchor_x += (fx - self.anchor_x) * ratio
-            self.anchor_y += (fy - self.anchor_y) * ratio
-            out_x = self.anchor_x
-            out_y = self.anchor_y
+            # Direction reversal check: if velocity opposes displacement from anchor,
+            # realign anchor so the cursor does not experience lagging hysteresis on reversal.
+            vec_x = fx - self.anchor_x
+            vec_y = fy - self.anchor_y
+            dot = vec_x * dx_hat + vec_y * dy_hat
+            if dot < 0.0 and speed > 60.0:
+                self.anchor_x = fx
+                self.anchor_y = fy
+                out_x = self.anchor_x
+                out_y = self.anchor_y
+            else:
+                excess = anchor_dist - effective_dz
+                ratio = excess / anchor_dist
+                self.anchor_x += (fx - self.anchor_x) * ratio
+                self.anchor_y += (fy - self.anchor_y) * ratio
+                out_x = self.anchor_x
+                out_y = self.anchor_y
 
         return out_x, out_y, fx, fy, False, ""
 
@@ -565,6 +582,7 @@ class CalibrationModel:
         self.screen_bounds = None
         self.cal_up_span = None
         self.cal_down_span = None
+        self.v_scale = 1.0
         self.v_scale_up = 1.0
         self.v_scale_down = 1.0
 
@@ -726,21 +744,23 @@ class CalibrationModel:
             )
 
         # Vertical calibration targets & Top/Center/Bottom reach diagnostic
-        # Compute actual measured spans from calibration fit to ensure complete downward reach
+        # Symmetric linear mapping: maps vertical calibration span [0.08*sh, 0.92*sh] to [SAFE_MARGIN, sh - SAFE_MARGIN]
+        # guaranteeing identical gain and responsiveness for upward and downward eye movements without center kinks.
         top_row_y = float(np.mean([summary["full_preds"][i][1] for i in (0, 1, 2)]))
         mid_row_y = float(np.mean([summary["full_preds"][i][1] for i in (3, 4, 5)]))
         bot_row_y = float(np.mean([summary["full_preds"][i][1] for i in (6, 7, 8)]))
-        self.cal_up_span = max(float(mid_row_y - top_row_y), 50.0)
-        self.cal_down_span = max(float(bot_row_y - mid_row_y), 50.0)
+        self.cal_up_span = float(mid_row_y - top_row_y)
+        self.cal_down_span = float(bot_row_y - mid_row_y)
 
         mid_y = screen_h / 2.0
-        safe_top_span = mid_y - SAFE_MARGIN
-        safe_bottom_span = (screen_h - SAFE_MARGIN) - mid_y
-        self.v_scale_up = float(np.clip(safe_top_span / self.cal_up_span, 0.90, 1.45))
-        self.v_scale_down = float(np.clip(safe_bottom_span / self.cal_down_span, 0.90, 1.45))
+        cal_v_half_span = (0.92 - 0.50) * screen_h
+        safe_v_half_span = mid_y - SAFE_MARGIN
+        self.v_scale = float(safe_v_half_span / cal_v_half_span if cal_v_half_span > 0 else 1.0)
+        self.v_scale_up = self.v_scale
+        self.v_scale_down = self.v_scale
 
         print("\n  [Calibration Diagnostic: Vertical (Top/Center/Bottom) Reach Comparison]")
-        print(f"    Measured Spans: Up={self.cal_up_span:.1f}px (Scale: {self.v_scale_up:.3f}) | Down={self.cal_down_span:.1f}px (Scale: {self.v_scale_down:.3f})")
+        print(f"    Symmetric Vertical Scale: {self.v_scale:.3f} (Half-Span: {cal_v_half_span:.1f}px -> Safe: {safe_v_half_span:.1f}px)")
         expected_top_safe = SAFE_MARGIN
         expected_bottom_safe = screen_h - SAFE_MARGIN
         vert_check_indices = [
@@ -750,8 +770,7 @@ class CalibrationModel:
         ]
         for p_idx, p_name in vert_check_indices:
             raw_py = float(summary["full_preds"][p_idx][1])
-            v_scale = self.v_scale_down if raw_py >= mid_y else self.v_scale_up
-            mapped_py = mid_y + (raw_py - mid_y) * v_scale
+            mapped_py = mid_y + (raw_py - mid_y) * self.v_scale
             expected_cal_y = screen_targets_9[p_idx][1]
             raw_v_feat = train_X[p_idx, 1]
             if p_idx == 7:
@@ -805,13 +824,14 @@ class CalibrationModel:
             pred_x = mid_x + (pred_x - mid_x) * h_scale
 
         # Vertical calibration range correction:
-        # Maps calibrated downward and upward spans to safe screen bounds [SAFE_MARGIN, sh - SAFE_MARGIN]
-        # using actual measured calibration ranges to ensure reliable reach to screen top and bottom edges.
+        # Maps vertical calibration span [0.08*sh, 0.92*sh] to safe screen span [SAFE_MARGIN, sh - SAFE_MARGIN]
+        # using symmetric linear scaling identical to horizontal mapping, eliminating center kinks and resistance.
         mid_y = sh / 2.0
-        if pred_y >= mid_y:
-            pred_y = mid_y + (pred_y - mid_y) * self.v_scale_down
-        else:
-            pred_y = mid_y + (pred_y - mid_y) * self.v_scale_up
+        cal_v_half_span = (0.92 - 0.50) * sh
+        safe_v_half_span = mid_y - SAFE_MARGIN
+        if cal_v_half_span > 0:
+            v_scale = safe_v_half_span / cal_v_half_span
+            pred_y = mid_y + (pred_y - mid_y) * v_scale
 
         return pred_x, pred_y
 
