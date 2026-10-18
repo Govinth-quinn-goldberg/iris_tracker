@@ -50,8 +50,8 @@ SCREEN_WIDTH = 1920
 SCREEN_HEIGHT = 1200
 
 # --- Cursor Speed & Motion Control ---
-# Speed scaling factor (0.1 to 1.0): 0.20 provides calm, slow, controllable movement
-CURSOR_SPEED_SCALE = 0.20
+# Speed scaling factor (0.1 to 1.0): 0.35 provides responsive tracking and eliminates tail lag
+CURSOR_SPEED_SCALE = 0.35
 
 # Maximum cursor velocity in pixels per second
 MAX_CURSOR_SPEED_PX_SEC = 900.0
@@ -69,14 +69,14 @@ MIN_DISPATCH_STEP_PX = 1.5
 # Low cutoff frequency during steady gaze (Hz). Lower = rock-solid resting cursor.
 MIN_CUTOFF = 0.35
 
-# Saccade responsiveness factor. Higher = fast, lag-free eye saccades.
-BETA = 0.015
+# Saccade responsiveness factor. Tuned for screen-pixel velocity to eliminate jitter.
+BETA = 0.005
 
 # Cutoff frequency for derivative estimation (Hz).
 D_CUTOFF = 1.0
 
-# Resting dead zone in screen pixels (suppresses involuntary micro-tremor).
-DEAD_ZONE_PX = 14.0
+# Resting dead zone in screen pixels (locks cursor during fixation with zero drift).
+DEAD_ZONE_PX = 10.0
 
 # Head pose low-pass smoothing factor (heavy smoothing decouples head jitter).
 HEAD_SMOOTH_ALPHA = 0.06
@@ -92,10 +92,10 @@ STALE_GAZE_TIMEOUT_SEC = 0.35
 
 # --- Wink Detection ---
 WINK_CLOSE_RATIO = 0.55
-WINK_OPEN_RATIO = 0.75
-WINK_CONFIRM_FRAMES = 3
-CLICK_COOLDOWN_SEC = 1.0
-BASELINE_MIN_SAMPLES = 45
+WINK_OPEN_RATIO = 0.65
+WINK_CONFIRM_FRAMES = 2
+CLICK_COOLDOWN_SEC = 0.8
+BASELINE_MIN_SAMPLES = 20
 
 # --- Deliberate Blink Command Configuration (Hands-Free Control) ---
 # Commands: 3 blinks -> Calibration ('C'), 4 blinks -> Cursor Test ('B'),
@@ -326,15 +326,18 @@ class AdaptiveGazeFilter:
             fallback_y = self.y_prev if self.y_prev is not None else self.screen_h / 2.0
             return fallback_x, fallback_y, fallback_x, fallback_y, True, reason
 
-        if self.t_prev is None:
+        # Reset filter on first frame or after stale gaze resumption (> STALE_GAZE_TIMEOUT_SEC)
+        if self.t_prev is None or (t - self.t_prev) > STALE_GAZE_TIMEOUT_SEC:
             self.t_prev = t
             self.x_prev = x
             self.y_prev = y
+            self.dx_prev = 0.0
+            self.dy_prev = 0.0
             self.anchor_x = x
             self.anchor_y = y
             return x, y, x, y, False, ""
 
-        dt = max(t - self.t_prev, 1e-4)
+        dt = min(max(t - self.t_prev, 1e-4), 0.10)
 
         # 2. 1 Euro Filter for X
         dx = (x - self.x_prev) / dt
@@ -357,16 +360,28 @@ class AdaptiveGazeFilter:
         self.dx_prev = dx_hat
         self.dy_prev = dy_hat
 
-        # 4. Dead Zone Logic: locks cursor during resting tremor, re-anchors during saccades
+        # 4. Continuous Speed-Modulated Dead Zone:
+        # - Saccades (speed >= 150 px/s): effective dead zone smoothly collapses to 0 px,
+        #   allowing the anchor to follow true gaze with ZERO lagging deficit or creep.
+        # - Resting Fixation (speed ~ 0 px/s): effective dead zone expands to DEAD_ZONE_PX,
+        #   locking the cursor with 0.000 px drift and zero micro-tremor.
+        # - Slow Smooth Pursuit / Drift: continuous boundary pull smoothly slides the anchor
+        #   without any discrete snapping steps.
+        speed = np.hypot(dx_hat, dy_hat)
+        saccade_speed = 150.0
+        effective_dz = self.dead_zone_px * max(0.0, 1.0 - speed / saccade_speed)
         anchor_dist = np.hypot(fx - self.anchor_x, fy - self.anchor_y)
-        if anchor_dist < self.dead_zone_px:
+
+        if anchor_dist <= effective_dz or (effective_dz <= 1e-6 and anchor_dist < 1e-6):
             out_x = self.anchor_x
             out_y = self.anchor_y
         else:
-            self.anchor_x = fx
-            self.anchor_y = fy
-            out_x = fx
-            out_y = fy
+            excess = anchor_dist - effective_dz
+            ratio = excess / anchor_dist
+            self.anchor_x += (fx - self.anchor_x) * ratio
+            self.anchor_y += (fy - self.anchor_y) * ratio
+            out_x = self.anchor_x
+            out_y = self.anchor_y
 
         return out_x, out_y, fx, fy, False, ""
 
@@ -446,11 +461,11 @@ class GazeFeatureExtractor:
         l_canthi_mid_y = (l_outer[1] + l_inner[1]) / 2.0
 
         u_l = (l_iris[0] - l_center_x) / l_width
-        v_l_aperture = (l_iris[1] - l_eyelid_mid_y) / l_height
         v_l_canthi = (l_iris[1] - l_canthi_mid_y) / (l_width * 0.45)
-        # Downward gaze: eyelid follows iris down (lid-lag), collapsing aperture distance.
-        # Bone-fixed canthi provide stable, uncompressed downward displacement.
-        v_l = v_l_canthi if v_l_canthi > 0 else (v_l_aperture + v_l_canthi) / 2.0
+        v_l_aperture = (l_iris[1] - l_eyelid_mid_y) / l_height
+        # Bone-fixed canthi normalization: smooth, continuous across the vertical field,
+        # and completely immune to eyelid flutter, squinting, and micro-blinks.
+        v_l = v_l_canthi
 
         # --- Right Eye in mirrored frame (user's physical right eye) ---
         r_outer = landmark_to_normalized_xy(landmarks[RIGHT_EYE_EAR_DEF["outer"]])  # 263
@@ -467,11 +482,11 @@ class GazeFeatureExtractor:
         r_canthi_mid_y = (r_outer[1] + r_inner[1]) / 2.0
 
         u_r = (r_iris[0] - r_center_x) / r_width
-        v_r_aperture = (r_iris[1] - r_eyelid_mid_y) / r_height
         v_r_canthi = (r_iris[1] - r_canthi_mid_y) / (r_width * 0.45)
-        # Downward gaze: eyelid follows iris down (lid-lag), collapsing aperture distance.
-        # Bone-fixed canthi provide stable, uncompressed downward displacement.
-        v_r = v_r_canthi if v_r_canthi > 0 else (v_r_aperture + v_r_canthi) / 2.0
+        v_r_aperture = (r_iris[1] - r_eyelid_mid_y) / r_height
+        # Bone-fixed canthi normalization: smooth, continuous across the vertical field,
+        # and completely immune to eyelid flutter, squinting, and micro-blinks.
+        v_r = v_r_canthi
 
         # Plausibility sanity checks: iris must be near eye aperture
         if abs(u_l) > 1.8 or abs(v_l) > 2.0 or abs(u_r) > 1.8 or abs(v_r) > 2.0:
@@ -819,6 +834,7 @@ class WinkDetector:
         self._right_wink_counter = 0
         self._gesture_latched = False
         self._last_click_timestamp = 0.0
+        self._last_diag_time = 0.0
 
     @property
     def baseline_ready(self):
@@ -827,7 +843,7 @@ class WinkDetector:
     def add_baseline_sample(self, left_ear, right_ear):
         if self.baseline_ready:
             return
-        if left_ear > 0.15 and right_ear > 0.15:
+        if left_ear > 0.12 and right_ear > 0.12:
             self._samples_left.append(left_ear)
             self._samples_right.append(right_ear)
 
@@ -844,15 +860,22 @@ class WinkDetector:
         self._right_wink_counter = 0
         self._gesture_latched = False
         self._last_click_timestamp = 0.0
+        self._last_diag_time = 0.0
 
     def update(self, left_ear, right_ear):
         if not self.baseline_ready:
             return None
 
-        left_closed = left_ear < (self.baseline_left * WINK_CLOSE_RATIO)
-        right_closed = right_ear < (self.baseline_right * WINK_CLOSE_RATIO)
-        left_open = left_ear > (self.baseline_left * WINK_OPEN_RATIO)
-        right_open = right_ear > (self.baseline_right * WINK_OPEN_RATIO)
+        now = time.monotonic()
+        close_thresh_l = self.baseline_left * WINK_CLOSE_RATIO
+        close_thresh_r = self.baseline_right * WINK_CLOSE_RATIO
+        open_thresh_l = self.baseline_left * WINK_OPEN_RATIO
+        open_thresh_r = self.baseline_right * WINK_OPEN_RATIO
+
+        left_closed = left_ear < close_thresh_l
+        right_closed = right_ear < close_thresh_r
+        left_open = left_ear > open_thresh_l
+        right_open = right_ear > open_thresh_r
 
         both_closed = left_closed and right_closed
         neither_closed = (not left_closed) and (not right_closed)
@@ -864,22 +887,57 @@ class WinkDetector:
                 self._gesture_latched = False
             return None
 
-        if left_closed and right_open:
+        # Check monocular wink candidates with asymmetry guard:
+        # In a genuine monocular wink, the open eye is substantially higher than the closed eye (>= 0.035 delta)
+        left_wink_cand = left_closed and right_open and (right_ear - left_ear >= 0.035)
+        right_wink_cand = right_closed and left_open and (left_ear - right_ear >= 0.035)
+
+        if left_wink_cand:
             self._right_wink_counter = 0
             self._left_wink_counter += 1
-        elif right_closed and left_open:
+            if now - self._last_diag_time > 0.35:
+                self._last_diag_time = now
+                print(
+                    f"  [WINK DIAG PROGRESS] Left Eye wink candidate (Frame {self._left_wink_counter}/{WINK_CONFIRM_FRAMES}): "
+                    f"L={left_ear:.3f} (<{close_thresh_l:.3f}), R={right_ear:.3f} (>{open_thresh_r:.3f}) | Latched={self._gesture_latched}"
+                )
+        elif right_wink_cand:
             self._left_wink_counter = 0
             self._right_wink_counter += 1
+            if now - self._last_diag_time > 0.35:
+                self._last_diag_time = now
+                print(
+                    f"  [WINK DIAG PROGRESS] Right Eye wink candidate (Frame {self._right_wink_counter}/{WINK_CONFIRM_FRAMES}): "
+                    f"R={right_ear:.3f} (<{close_thresh_r:.3f}), L={left_ear:.3f} (>{open_thresh_l:.3f}) | Latched={self._gesture_latched}"
+                )
         else:
+            # Diagnostics on rejection if one eye is closed but opposite eye failed open threshold or asymmetry
+            if (left_closed or right_closed) and (now - self._last_diag_time > 0.35):
+                self._last_diag_time = now
+                if left_closed and not right_open:
+                    print(
+                        f"  [WINK DIAG REJECT] Physical Left eye closed (EAR={left_ear:.3f} < {close_thresh_l:.3f}), "
+                        f"but Right eye not open enough (EAR={right_ear:.3f} <= {open_thresh_r:.3f}) [Squint/Bilateral]"
+                    )
+                elif right_closed and not left_open:
+                    print(
+                        f"  [WINK DIAG REJECT] Physical Right eye closed (EAR={right_ear:.3f} < {close_thresh_r:.3f}), "
+                        f"but Left eye not open enough (EAR={left_ear:.3f} <= {open_thresh_l:.3f}) [Squint/Bilateral]"
+                    )
             self._left_wink_counter = 0
             self._right_wink_counter = 0
             return None
 
         if self._gesture_latched:
+            if now - self._last_diag_time > 0.35:
+                self._last_diag_time = now
+                print("  [WINK DIAG BLOCKED] Wink sustained but gesture is latched (reopen both eyes to re-arm)")
             return None
 
-        now = time.monotonic()
         if now - self._last_click_timestamp < CLICK_COOLDOWN_SEC:
+            if now - self._last_diag_time > 0.35:
+                self._last_diag_time = now
+                print(f"  [WINK DIAG BLOCKED] Click cooldown active ({CLICK_COOLDOWN_SEC - (now - self._last_click_timestamp):.2f}s remaining)")
             return None
 
         if self._left_wink_counter >= WINK_CONFIRM_FRAMES:
@@ -970,7 +1028,7 @@ class BlinkCommandDetector:
 
     @property
     def is_collecting_command(self):
-        return self.sequence_active or (self.state == "CLOSED")
+        return self.sequence_active and (self.blink_count >= 2)
 
     def get_status_info(self, now=None):
         if now is None:
@@ -1072,34 +1130,40 @@ class CursorController:
         self.last_dispatched_y = int(self.pos_y)
         self.last_update_t = time.monotonic()
 
-    def update(self, target_x, target_y, move_mouse=False):
+    def update(self, target_x, target_y, move_mouse=False, dt=None):
         now = time.monotonic()
-        dt = max(now - self.last_update_t, 1e-4)
+        if dt is None:
+            dt = max(now - self.last_update_t, 1e-4)
         self.last_update_t = now
 
         margin = SAFE_MARGIN
         tx = float(np.clip(target_x, margin, self.screen_w - margin))
         ty = float(np.clip(target_y, margin, self.screen_h - margin))
+        rem_dist = np.hypot(tx - self.pos_x, ty - self.pos_y)
 
-        # Absolute asymptotic convergence with controlled speed scale
-        step_x = (tx - self.pos_x) * self.speed_scale
-        step_y = (ty - self.pos_y) * self.speed_scale
-        step_dist = np.hypot(step_x, step_y)
+        # Sub-pixel precision landing: snap directly when within 2.0 px to prevent asymptotic tail stalling
+        if rem_dist < 2.0:
+            self.pos_x = tx
+            self.pos_y = ty
+        else:
+            step_x = (tx - self.pos_x) * self.speed_scale
+            step_y = (ty - self.pos_y) * self.speed_scale
+            step_dist = np.hypot(step_x, step_y)
 
-        # Enforce maximum velocity and step limit
-        max_allowed_dist = min(MAX_STEP_PX, MAX_CURSOR_SPEED_PX_SEC * dt)
-        if step_dist > max_allowed_dist:
-            scale = max_allowed_dist / step_dist
-            step_x *= scale
-            step_y *= scale
+            max_allowed_dist = min(MAX_STEP_PX, MAX_CURSOR_SPEED_PX_SEC * dt)
+            if step_dist > max_allowed_dist:
+                scale = max_allowed_dist / step_dist
+                step_x *= scale
+                step_y *= scale
 
-        self.pos_x = float(np.clip(self.pos_x + step_x, margin, self.screen_w - margin))
-        self.pos_y = float(np.clip(self.pos_y + step_y, margin, self.screen_h - margin))
+            self.pos_x = float(np.clip(self.pos_x + step_x, margin, self.screen_w - margin))
+            self.pos_y = float(np.clip(self.pos_y + step_y, margin, self.screen_h - margin))
 
         if move_mouse:
             ix = int(self.pos_x)
             iy = int(self.pos_y)
-            if np.hypot(ix - self.last_dispatched_x, iy - self.last_dispatched_y) >= MIN_DISPATCH_STEP_PX:
+            disp_dist = np.hypot(ix - self.last_dispatched_x, iy - self.last_dispatched_y)
+            if disp_dist >= MIN_DISPATCH_STEP_PX or (rem_dist < 2.0 and (ix != self.last_dispatched_x or iy != self.last_dispatched_y)):
                 try:
                     pyautogui.moveTo(ix, iy, _pause=False)
                     self.last_dispatched_x = ix
@@ -1682,6 +1746,15 @@ def main():
             # Hands-Free Deliberate Blink Commands Dispatcher
             blink_cmd = None
             if left_ear is not None and right_ear is not None and not face_is_lost:
+                # If baseline is not ready yet and in preview mode with steady open eyes, auto-initialize
+                if not wink_detector.baseline_ready and mode == "preview":
+                    if left_ear > 0.13 and right_ear > 0.13:
+                        wink_detector.add_baseline_sample(left_ear, right_ear)
+                        if wink_detector.baseline_ready:
+                            print(
+                                f"  [Baseline] Auto-initialized Preview Neutral EAR: Left={wink_detector.baseline_left:.3f}, Right={wink_detector.baseline_right:.3f}"
+                            )
+
                 if wink_detector.baseline_ready:
                     blink_cmd_detector.update_baseline(wink_detector.baseline_left, wink_detector.baseline_right)
 
@@ -1714,6 +1787,8 @@ def main():
                     filt_pred_x, filt_pred_y, pure_pred_x, pure_pred_y, is_outlier_frame, outlier_reason_str = gaze_filter.filter(
                         time.monotonic(), raw_pred_x, raw_pred_y
                     )
+                    if is_outlier_frame:
+                        filt_pred_x, filt_pred_y = None, None
 
             # ── 5. Mode Handlers ────────────────────────────────────
 
@@ -1792,7 +1867,8 @@ def main():
 
                         if feat_dict is not None and face_detected and iris_detected:
                             cal_buffer.append(feat_dict["vector_4d"].copy())
-                            if left_ear is not None and right_ear is not None:
+                            # Sample neutral baseline EAR strictly during Center Target (Point 5, index 4)
+                            if cal_index == 4 and left_ear is not None and right_ear is not None:
                                 wink_detector.add_baseline_sample(left_ear, right_ear)
 
                         pct = min(elapsed_collect / CALIBRATION_COLLECT_SEC, 1.0)
@@ -1812,10 +1888,22 @@ def main():
                                 cal_gaze_samples_median.append(robust_feature)
                                 cal_screen_targets.append(current_target)
 
+                                if cal_index == 4:
+                                    if not wink_detector.baseline_ready and len(wink_detector._samples_left) >= CALIBRATION_MIN_SAMPLES:
+                                        wink_detector.baseline_left = float(np.median(wink_detector._samples_left))
+                                        wink_detector.baseline_right = float(np.median(wink_detector._samples_right))
+                                    if wink_detector.baseline_ready:
+                                        print(
+                                            f"  [Baseline] Established Center Neutral EAR: Left={wink_detector.baseline_left:.3f}, Right={wink_detector.baseline_right:.3f}"
+                                        )
+
                                 cal_index += 1
                                 cal_status_message = f"Point {cal_index} OK ({len(cal_buffer)} samples)"
                                 print(f"  [Calibration] Captured point {cal_index}/{len(cal_targets_px)} -> Median Feature: u={robust_feature[0]:+.3f}, v={robust_feature[1]:+.3f}")
                             else:
+                                if cal_index == 4 and not wink_detector.baseline_ready:
+                                    wink_detector._samples_left.clear()
+                                    wink_detector._samples_right.clear()
                                 reason = "No face/iris" if not face_detected else "Eyes blinked"
                                 cal_status_message = f"Rejected: {len(cal_buffer)} samples ({reason}). Retry."
                                 print(f"  [Calibration] {cal_status_message}")
@@ -1892,22 +1980,28 @@ def main():
 
                 if detected_gesture is not None:
                     now_t = time.monotonic()
-                    if detected_gesture == "right_wink":
-                        active_wink_label = "GESTURE: RIGHT WINK --> (Left Click)"
+                    if detected_gesture == "left_wink":
+                        active_wink_label = "GESTURE: LEFT WINK --> (Left Click)"
                         active_wink_expiry = now_t + 1.2
                         if mode == "full_control":
                             try:
                                 pyautogui.click(button="left", _pause=False)
-                                print("  [ACTION] Right Wink --> Left Click executed")
+                                print(
+                                    f"  [ACTION] Left Wink --> Left Click executed "
+                                    f"(EAR: L={left_ear:.3f}, R={right_ear:.3f} | Base: L={wink_detector.baseline_left:.3f}, R={wink_detector.baseline_right:.3f})"
+                                )
                             except pyautogui.FailSafeException:
                                 raise
-                    elif detected_gesture == "left_wink":
-                        active_wink_label = "GESTURE: LEFT WINK --> (Right Click)"
+                    elif detected_gesture == "right_wink":
+                        active_wink_label = "GESTURE: RIGHT WINK --> (Right Click)"
                         active_wink_expiry = now_t + 1.2
                         if mode == "full_control":
                             try:
                                 pyautogui.click(button="right", _pause=False)
-                                print("  [ACTION] Left Wink --> Right Click executed")
+                                print(
+                                    f"  [ACTION] Right Wink --> Right Click executed "
+                                    f"(EAR: L={left_ear:.3f}, R={right_ear:.3f} | Base: L={wink_detector.baseline_left:.3f}, R={wink_detector.baseline_right:.3f})"
+                                )
                             except pyautogui.FailSafeException:
                                 raise
 
@@ -2010,6 +2104,18 @@ def main():
                 if calibration.cal_down_span is not None:
                     hud_lines.append(
                         f"[EXT DIAG] V-Scale: Down={calibration.v_scale_down:.3f} (Span={calibration.cal_down_span:.0f}px) | Up={calibration.v_scale_up:.3f} (Span={calibration.cal_up_span:.0f}px)"
+                    )
+                if wink_detector.baseline_ready and left_ear is not None and right_ear is not None:
+                    l_close = left_ear < (wink_detector.baseline_left * WINK_CLOSE_RATIO)
+                    l_open = left_ear > (wink_detector.baseline_left * WINK_OPEN_RATIO)
+                    r_close = right_ear < (wink_detector.baseline_right * WINK_CLOSE_RATIO)
+                    r_open = right_ear > (wink_detector.baseline_right * WINK_OPEN_RATIO)
+                    l_st = "CLOSED" if l_close else ("OPEN" if l_open else "OPEN_PARTIAL")
+                    r_st = "CLOSED" if r_close else ("OPEN" if r_open else "OPEN_PARTIAL")
+                    hud_lines.append(
+                        f"[EXT DIAG] Wink EAR: L={left_ear:.3f}({l_st},Ctr:{wink_detector._left_wink_counter}) "
+                        f"R={right_ear:.3f}({r_st},Ctr:{wink_detector._right_wink_counter}) | "
+                        f"Base:({wink_detector.baseline_left:.2f},{wink_detector.baseline_right:.2f}) | Latched:{wink_detector._gesture_latched}"
                     )
 
             if time.monotonic() < active_wink_expiry:
